@@ -12,7 +12,10 @@ use entities::missing_track::MissingTrack;
 use repositories::lyrics_repository::get_last_10_mins_lyrics_count;
 use tracing_subscriber::EnvFilter;
 use std::{path::PathBuf, time::Duration};
+use std::collections::HashSet;
+use std::future::Future;
 use r2d2::Pool;
+use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 use routes::{
   get_lyrics_by_metadata,
@@ -21,17 +24,21 @@ use routes::{
   request_challenge,
   publish_lyrics,
   flag_lyrics,
+  manage
 };
+use routes::search_lyrics::CachedResult;
+use routes::get_lyrics_by_metadata::TrackResponse as GetLyricsByMetadataResponse;
 use std::sync::Arc;
+use dashmap::DashMap;
 use db::init_db;
 use tower_http::{
   cors::{Any, CorsLayer}, trace::{self, TraceLayer}
 };
 use tracing::Span;
 use moka::future::Cache;
-use tokio::signal;
-use queue::start_queue;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::{signal, sync::watch};
+use std::sync::atomic::{AtomicUsize, AtomicU8, Ordering};
+use tokio::sync::Mutex;
 use crossbeam_queue::ArrayQueue;
 
 pub mod errors;
@@ -40,54 +47,71 @@ pub mod entities;
 pub mod repositories;
 pub mod utils;
 pub mod db;
+#[path = "queue_stub.rs"]
 pub mod queue;
-pub mod providers;
 
 pub struct AppState {
   pool: Pool<SqliteConnectionManager>,
   challenge_cache: Cache<String, String>,
   get_cache: Cache<String, String>,
-  search_cache: Cache<String, String>,
+  get_metadata_cache: Cache<String, GetLyricsByMetadataResponse>,
+  get_metadata_index: DashMap<i64, HashSet<String>>,
+  search_cache: Cache<String, CachedResult>,
   queue: ArrayQueue<MissingTrack>,
   request_counter: AtomicUsize,
   recent_lyrics_count: AtomicUsize,
+  workers_count: AtomicU8,
+  workers_tx: Mutex<Option<watch::Sender<u8>>>,
 }
 
-pub async fn serve(port: u16, database: &PathBuf, workers_count: u8) {
-  tracing_subscriber::fmt()
-    .compact()
-    .with_env_filter(EnvFilter::from_env("LRCLIB_LOG"))
-    .init();
+impl AppState {
+  pub fn db_connection(&self) -> Result<PooledConnection<SqliteConnectionManager>, r2d2::Error> {
+    self.pool.get()
+  }
 
-  let pool = init_db(database).expect("Cannot initialize connection to SQLite database!");
+  pub fn enqueue_missing_track(&self, missing_track: MissingTrack) -> Result<(), MissingTrack> {
+    self.queue.push(missing_track)
+  }
 
-  let state = Arc::new(
-    AppState {
-      pool,
-      challenge_cache: Cache::<String, String>::builder()
-        .time_to_live(Duration::from_secs(60 * 5))
-        .max_capacity(100000)
-        .build(),
-      get_cache: Cache::<String, String>::builder()
-        .time_to_live(Duration::from_secs(60 * 60 * 24 * 7))
-        .max_capacity(5000000)
-        .build(),
-      search_cache: Cache::<String, String>::builder()
-        .time_to_live(Duration::from_secs(60 * 60 * 24))
-        .time_to_idle(Duration::from_secs(60 * 60 * 4))
-        .max_capacity(400000)
-        .build(),
-      queue: ArrayQueue::new(600000),
-      request_counter: AtomicUsize::new(0),
-      recent_lyrics_count: AtomicUsize::new(0),
+  pub fn dequeue_missing_track(&self) -> Option<MissingTrack> {
+    self.queue.pop()
+  }
+
+  pub fn missing_tracks_len(&self) -> usize {
+    self.queue.len()
+  }
+}
+
+/// Spawns a background task that reports request metrics every minute.
+fn spawn_metrics_reporter(state: Arc<AppState>) {
+  tokio::spawn(async move {
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    loop {
+      interval.tick().await;
+      let count = state.request_counter.swap(0, Ordering::Relaxed);
+      tracing::info!(message = "requests in the last minute", requests_count = count);
     }
-  );
+  });
+}
 
-  let state_for_logging = state.clone();
-  let state_for_metrics = state.clone();
-  let state_for_recent_lyrics_count = state.clone();
-  let state_for_queue = state.clone();
+/// Spawns a background task that updates the recent lyrics count every minute.
+fn spawn_lyrics_counter(state: Arc<AppState>) {
+  tokio::spawn(async move {
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    loop {
+      interval.tick().await;
+      let mut conn = state.pool.get().unwrap();
+      let count = get_last_10_mins_lyrics_count(&mut conn).unwrap();
+      state.recent_lyrics_count.store(count as usize, Ordering::Relaxed);
+    }
+  });
+}
 
+/// Builds the application router with all routes, middleware, and CORS configuration.
+fn build_router(state: Arc<AppState>, state_for_logging: Arc<AppState>) -> Router {
+  // Build API routes
   let api_routes = Router::new()
     .route("/get", get(get_lyrics_by_metadata::route))
     .route("/get/:track_id", get(get_lyrics_by_track_id::route))
@@ -96,30 +120,14 @@ pub async fn serve(port: u16, database: &PathBuf, workers_count: u8) {
     .route("/publish", post(publish_lyrics::route))
     .route("/flag", post(flag_lyrics::route));
 
-  // Metrics
-  tokio::spawn(async move {
-    tokio::time::sleep(Duration::from_secs(60)).await;
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
-    loop {
-      interval.tick().await;
-      let count = state_for_metrics.request_counter.swap(0, Ordering::Relaxed);
-      tracing::info!(message = "requests in the last minute", requests_count = count);
-    }
-  });
+  // Build management routes
+  let manage_routes = Router::new()
+    .route("/set-config", post(manage::set_config::route));
 
-  // Recent lyrics count
-  tokio::spawn(async move {
-    tokio::time::sleep(Duration::from_secs(60)).await;
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
-    loop {
-      interval.tick().await;
-      let mut conn = state_for_recent_lyrics_count.pool.get().unwrap();
-      let count = get_last_10_mins_lyrics_count(&mut conn).unwrap();
-      state_for_recent_lyrics_count.recent_lyrics_count.store(count as usize, Ordering::Relaxed);
-    }
-  });
+  // Add management routes to the API router
+  let api_routes = api_routes.nest("/manage", manage_routes);
 
-  let app = Router::new()
+  Router::new()
     .nest("/api", api_routes)
     .with_state(state)
     .layer(
@@ -170,14 +178,93 @@ pub async fn serve(port: u16, database: &PathBuf, workers_count: u8) {
           "X-User-Agent".parse().unwrap(),
           "Lrclib-Client".parse().unwrap()
         ])
-    );
+    )
+}
 
-  tokio::spawn(async move {
-    start_queue(workers_count, state_for_queue).await;
-  });
+/// Spawns the worker supervisor for dynamic worker count adjustment.
+async fn spawn_worker_supervisor<F, Fut>(state: Arc<AppState>, initial_workers: u8, queue_starter: F)
+where
+  F: Fn(u8, watch::Receiver<u8>, Arc<AppState>) -> Fut + Copy + Send + Sync + 'static,
+  Fut: Future<Output = ()> + Send + 'static,
+{
+  // Store the initial workers count in AppState
+  state.workers_count.store(initial_workers, Ordering::SeqCst);
 
+  // Channel used to instruct the queue supervisor about desired worker count.
+  let (workers_tx, workers_rx) = watch::channel::<u8>(initial_workers);
+
+  // Store the sender in AppState for later use by the API
+  *state.workers_tx.lock().await = Some(workers_tx);
+
+  // Spawn the supervisor (it will in turn spawn workers).
+  tokio::spawn(queue_starter(initial_workers, workers_rx, state.clone()));
+}
+
+/// Build the application state with all caches and shared resources.
+fn build_app_state(pool: Pool<SqliteConnectionManager>) -> Arc<AppState> {
+  Arc::new(
+    AppState {
+      pool,
+      challenge_cache: Cache::<String, String>::builder()
+        .time_to_live(Duration::from_secs(60 * 5))
+        .max_capacity(500000)
+        .build(),
+      get_cache: Cache::<String, String>::builder()
+        .time_to_live(Duration::from_secs(60 * 60 * 24 * 7))
+        .max_capacity(10000000)
+        .build(),
+      get_metadata_cache: Cache::<String, GetLyricsByMetadataResponse>::builder()
+        .max_capacity(5000000)
+        .build(),
+      get_metadata_index: DashMap::new(),
+      search_cache: Cache::<String, CachedResult>::builder()
+        .time_to_live(Duration::from_secs(60 * 60 * 24))
+        .time_to_idle(Duration::from_secs(60 * 60 * 4))
+        .max_capacity(5000000)
+        .build(),
+      queue: ArrayQueue::new(600000),
+      request_counter: AtomicUsize::new(0),
+      recent_lyrics_count: AtomicUsize::new(0),
+      workers_count: AtomicU8::new(0),
+      workers_tx: Mutex::new(None),
+    }
+  )
+}
+
+/// Start the LRCLIB server on the specified port with the given database and worker count.
+pub async fn serve(port: u16, database: &PathBuf, workers_count: u8) {
+  serve_with_queue(port, database, workers_count, queue::start_queue).await;
+}
+
+/// Start the LRCLIB server with a custom queue backend.
+pub async fn serve_with_queue<F, Fut>(port: u16, database: &PathBuf, workers_count: u8, queue_starter: F)
+where
+  F: Fn(u8, watch::Receiver<u8>, Arc<AppState>) -> Fut + Copy + Send + Sync + 'static,
+  Fut: Future<Output = ()> + Send + 'static,
+{
+  // Initialize logging
+  tracing_subscriber::fmt()
+    .compact()
+    .with_env_filter(EnvFilter::from_env("LRCLIB_LOG"))
+    .init();
+
+  // Initialize database and application state
+  let pool = init_db(database).expect("Cannot initialize connection to SQLite database!");
+  let state = build_app_state(pool);
+
+  // Spawn background tasks
+  let state_for_logging = state.clone();
+  spawn_worker_supervisor(state.clone(), workers_count, queue_starter).await;
+  spawn_metrics_reporter(state.clone());
+  spawn_lyrics_counter(state.clone());
+
+  // Build the router and start the server
+  let app = build_router(state, state_for_logging);
   let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
+
   println!("LRCLIB server is listening on {}!", listener.local_addr().unwrap());
+
+  // Run the server with graceful shutdown
   axum::serve(listener, app)
     .with_graceful_shutdown(shutdown_signal())
     .await

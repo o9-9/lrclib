@@ -13,7 +13,11 @@ use std::sync::Arc;
 use crate::{
   errors::ApiError,
   repositories::{lyrics_repository, track_repository},
-  utils::{strip_timestamp, is_valid_publish_token},
+  utils::{
+    invalidate_get_metadata_cache_for_track_id,
+    is_valid_publish_token,
+    strip_timestamp,
+  },
   AppState
 };
 use axum_macros::debug_handler;
@@ -43,7 +47,12 @@ pub async fn route(
       if is_valid {
         {
           let mut conn = state.pool.get()?;
-          publish_lyrics(&payload, &mut conn)?;
+          let track_id = publish_lyrics(&payload, &mut conn)?;
+
+          invalidate_get_metadata_cache_for_track_id(
+            &state,
+            track_id,
+          ).await;
         }
 
         Ok(StatusCode::CREATED)
@@ -55,14 +64,15 @@ pub async fn route(
   }
 }
 
-fn publish_lyrics(payload: &PublishRequest, conn: &mut Connection) -> Result<()> {
+fn publish_lyrics(payload: &PublishRequest, conn: &mut Connection) -> Result<i64> {
   let mut tx = conn.transaction()?;
+  let duration = payload.duration.round();
 
   let existing_track = track_repository::get_track_id_by_metadata_tx(
     &payload.track_name.trim(),
     &payload.artist_name.trim(),
     &payload.album_name.trim(),
-    payload.duration,
+    duration,
     &mut tx,
   )?;
 
@@ -72,7 +82,7 @@ fn publish_lyrics(payload: &PublishRequest, conn: &mut Connection) -> Result<()>
       &payload.track_name.trim(),
       &payload.artist_name.trim(),
       &payload.album_name.trim(),
-      payload.duration,
+      duration,
       &mut tx,
     )?
   };
@@ -112,5 +122,5 @@ fn publish_lyrics(payload: &PublishRequest, conn: &mut Connection) -> Result<()>
 
   tx.commit()?;
 
-  Ok(())
+  Ok(track_id)
 }

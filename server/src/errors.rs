@@ -18,6 +18,7 @@ pub enum ApiError {
   IncorrectPublishTokenError,
   ValidationError(String),
   UnknownError(anyhow::Error),
+  InvalidManageTokenError,
 }
 
 impl IntoResponse for ApiError {
@@ -50,6 +51,16 @@ impl IntoResponse for ApiError {
           name: "ValidationError".to_owned(),
           status_code: StatusCode::BAD_REQUEST.as_u16(),
         }),
+      ).into_response(),
+      ApiError::InvalidManageTokenError => (
+        StatusCode::UNAUTHORIZED,
+        Json(
+          ApiErrorResponse {
+            message: "Invalid manage token".to_owned(),
+            name: "InvalidManageTokenError".to_owned(),
+            status_code: StatusCode::UNAUTHORIZED.as_u16(),
+          }
+        )
       ).into_response(),
       ApiError::UnknownError(err) => {
         tracing::error!(message = "unknown error happened", error = err.to_string());

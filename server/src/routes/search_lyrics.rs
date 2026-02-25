@@ -33,7 +33,7 @@ pub struct TrackResponse {
   synced_lyrics: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CachedResult {
   tracks: Vec<TrackResponse>,
   created_at: DateTime<Utc>,
@@ -54,14 +54,7 @@ pub async fn route(Query(params): Query<QueryParams>, State(state): State<Arc<Ap
     album_name.as_deref().unwrap_or_default()
   );
 
-  let cached_result: Option<CachedResult> = {
-    let cached_result_str = state.search_cache.get(&cache_key).await;
-    if let Some(cached_result_str) = cached_result_str {
-      serde_json::from_str(&cached_result_str).ok()
-    } else {
-      None
-    }
-  };
+  let cached_result = state.search_cache.get(&cache_key).await;
 
   if let Some(cached_result) = cached_result {
     let tracks: Vec<TrackResponse> = cached_result.tracks.clone();
@@ -161,7 +154,7 @@ async fn fetch_and_cache_tracks(
       created_at: Utc::now(),
   };
 
-  state.search_cache.insert(cache_key, serde_json::to_string(&cached_result)?).await;
+  state.search_cache.insert(cache_key, cached_result).await;
 
   Ok(response)
 }

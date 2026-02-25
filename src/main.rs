@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 use clap::{Parser, Subcommand};
+#[cfg(not(feature = "queue"))]
 use server::serve;
+#[cfg(feature = "queue")]
+use server::serve_with_queue;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -45,7 +48,15 @@ async fn main() {
 
   match &cli.command {
     Some(Commands::Serve { port, database, workers_count }) => {
-      serve(port.to_owned(), database, workers_count.to_owned()).await;
+      #[cfg(feature = "queue")]
+      {
+        serve_with_queue(port.to_owned(), database, workers_count.to_owned(), lrclib_queue::start_queue).await;
+      }
+
+      #[cfg(not(feature = "queue"))]
+      {
+        serve(port.to_owned(), database, workers_count.to_owned()).await;
+      }
     },
     None => {}
   }
